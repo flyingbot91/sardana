@@ -36,6 +36,7 @@ import datetime
 import operator
 import time
 import threading
+import weakref
 import numpy as np
 
 import PyTango
@@ -52,6 +53,7 @@ from taurus.core.util.user import USER_NAME
 from taurus.core.tango import FROM_TANGO_TO_STR_TYPE
 from taurus.core.util.enumeration import Enumeration
 from taurus.core.util.threadpool import ThreadPool
+from taurus.core.util.event import CallableRef
 
 from sardana.util.tree import BranchNode, LeafNode, Tree
 from sardana.util.motion import Motor as VMotor
@@ -255,13 +257,15 @@ class GScan(Logger):
 
     def __init__(self, macro, generator=None, moveables=[], env={},
                  constraints=[], extrainfodesc=[]):
-        self._macro = macro
+        self._macro = weakref.ref(macro)
+        if generator is not None:
+            generator = CallableRef(generator)
         self._generator = generator
         self._extrainfodesc = extrainfodesc
 
-        # nasty hack to make sure macro has access to gScan as soon as possible
-        # TODO: CAUTION! this may be causing a circular reference!
-        self._macro._gScan = self
+        # nasty hack to make sure macro has access to gScan as soon as
+        # possible
+        self.macro._gScan = self
         self._rec_manager = macro.getMacroServer().recorder_manager
 
         self._moveables, moveable_names = [], []
@@ -270,6 +274,8 @@ class GScan(Logger):
                 moveable = MoveableDesc(moveable=moveable)
             moveable_names.append(moveable.moveable.getName())
             self._moveables.append(moveable)
+
+        self._check_moveables_limits()
 
         name = self.__class__.__name__
         self.call__init__(Logger, name)
@@ -369,6 +375,43 @@ class GScan(Logger):
         # ---------------------------------------------------------------------
         self._setupEnvironment(env)
 
+    def _check_moveables_limits(self):
+        for m in self._moveables:
+            pos_range = m.moveable.getAttribute("Position").range
+            try:
+                high = float(pos_range[1].magnitude)    # Taurus 4
+            except AttributeError:
+                try:
+                    high = float(pos_range[1])          # Taurus 3
+                except ValueError:
+                    high = None
+            try:
+                low = float(pos_range[0].magnitude)     # Taurus 4
+            except AttributeError:
+                try:
+                    low = float(pos_range[0])           # Taurus 3
+                except ValueError:
+                    low = None
+
+            if any((high, low)) and not any((m.min_value, m.max_value)):
+                self.macro.info("Scan range is not defined for %s and could "
+                                 "not be verified against motor limits."
+                                 % m.moveable.getName())
+
+            for pos in (m.min_value, m.max_value):
+                if pos is None:
+                    continue
+                if high is not None:
+                    if float(pos) > high:
+                        raise RuntimeError(
+                            "requested movement of %s is above its upper limit"
+                            % m.moveable.getName())
+                if low is not None:
+                    if float(pos) < low:
+                        raise RuntimeError(
+                            "requested movement of %s is below its lower limit"
+                            % m.moveable.getName())
+
     def _getExtraColumns(self):
         ret = []
         try:
@@ -385,7 +428,7 @@ class GScan(Logger):
                 try:
                     if 'instrument' in kw:
                         type_class = Type.Instrument
-                        instrument = self._macro.getObj(kw['instrument'],
+                        instrument = self.macro.getObj(kw['instrument'],
                                                         type_class=type_class)
                         if instrument:
                             kw['instrument'] = instrument
@@ -722,7 +765,7 @@ class GScan(Logger):
         except Exception:
             env['ScanDir'] = None
         env['estimatedtime'], env['total_scan_intervals'] = self._estimate()
-        env['instrumentlist'] = self._macro.findObjs(
+        env['instrumentlist'] = self.macro.findObjs(
             '.*', type_class=Type.Instrument)
 
         # env.update(self._getExperimentConfiguration) #add all the info from
@@ -866,7 +909,7 @@ class GScan(Logger):
 
     @property
     def macro(self):
-        return self._macro
+        return self._macro()
 
     @property
     def measurement_group(self):
@@ -875,7 +918,7 @@ class GScan(Logger):
     @property
     def generator(self):
         """Generator of steps or waypoints used in this scan."""
-        return self._generator
+        return self._generator()
 
     @property
     def motion(self):
@@ -1006,8 +1049,15 @@ class SScan(GScan):
         macro = self.macro
         scream = False
 
+        self._deterministic_scan = False
         if hasattr(macro, "nr_points"):
             nr_points = float(macro.nr_points)
+            if hasattr(macro, "integ_time"):
+                integ_time = macro.integ_time
+                self.measurement_group.putIntegrationTime(integ_time)
+                self.measurement_group.setNbStarts(nr_points)
+                self.measurement_group.prepare()
+                self._deterministic_scan = True
             scream = True
         else:
             yield 0.0
@@ -1092,7 +1142,10 @@ class SScan(GScan):
         integ_time = step['integ_time']
         # Acquire data
         self.debug("[START] acquisition")
-        state, data_line = mg.count(integ_time)
+        if self._deterministic_scan:
+            state, data_line = mg.count_raw()
+        else:
+            state, data_line = mg.count(integ_time)
         for ec in self._extra_columns:
             data_line[ec.getName()] = ec.read()
         self.debug("[ END ] acquisition")
@@ -1391,8 +1444,12 @@ class CScan(GScan):
                 raise ScanException(msg)
 
     def do_restore(self):
-        super(CScan, self).do_restore()
+        # Restore motor backups (vel, acc, ...) first so the macro's
+        # do_restore finds the system as before GSF found it.
+        # This is especially important for dscan macros which must return
+        # to inital position at nominal speed even after user stop.
         self._restore_motors()
+        super(CScan, self).do_restore()
 
     def _setFastMotions(self, motors=None):
         '''make given motors go at their max speed and accel'''
@@ -1482,6 +1539,12 @@ class CScan(GScan):
         pos_obj = motor.getPositionObj()
         min_pos, _ = pos_obj.getRange()
         try:
+            # Taurus 4 uses quantities however Sardana does not support them
+            # yet - use magnitude for the moment.
+            min_pos = min_pos.magnitude
+        except AttributeError:
+            pass
+        try:
             min_pos = float(min_pos)
         except ValueError:
             min_pos = float('-Inf')
@@ -1494,6 +1557,12 @@ class CScan(GScan):
         '''
         pos_obj = motor.getPositionObj()
         _, max_pos = pos_obj.getRange()
+        try:
+            # Taurus 4 uses quantities however Sardana does not support them
+            # yet - use magnitude for the moment.
+            max_pos = max_pos.magnitude
+        except AttributeError:
+            pass
         try:
             max_pos = float(max_pos)
         except ValueError:
@@ -2657,8 +2726,8 @@ class TScan(GScan, CAcquisition):
                 hook()
 
         yield 0
-        measurement_group.measure(synchronization,
-                                  self.value_buffer_changed)
+        measurement_group.count_continuous(synchronization,
+                                           self.value_buffer_changed)
         self.debug("Waiting for value buffer events to be processed")
         self.wait_value_buffer()
         self.join_thread_pool()
